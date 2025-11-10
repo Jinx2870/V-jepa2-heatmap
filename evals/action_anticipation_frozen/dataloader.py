@@ -42,6 +42,8 @@ def init_data(
     auto_augment=False,
     motion_shift=False,
     anticipation_point=[0.1, 0.1],
+    heatmap_base_path=None,
+    use_heatmap=False,
 ):
     # -- make video transformations
     transform = make_transforms(
@@ -76,6 +78,8 @@ def init_data(
         persistent_workers=persistent_workers,
         pin_memory=pin_mem,
         anticipation_point=anticipation_point,
+        heatmap_base_path=heatmap_base_path,
+        use_heatmap=use_heatmap,
     )
 
     return dataset, data_loader, data_info

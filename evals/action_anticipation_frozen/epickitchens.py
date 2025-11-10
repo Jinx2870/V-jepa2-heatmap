@@ -88,6 +88,8 @@ class decode_videos_to_clips(wds.PipelineStage):
         transform=None,
         anticipation_time_sec=[0.0, 0.0],
         anticipation_point=[0.25, 0.75],
+        heatmap_base_path=None,
+        use_heatmap=False,
     ):
         self.annotations = annotations
         self.frames_per_clip = frames_per_clip
@@ -95,6 +97,8 @@ class decode_videos_to_clips(wds.PipelineStage):
         self.transform = transform
         self.anticipation_time = anticipation_time_sec
         self.anticipation_point = anticipation_point
+        self.heatmap_base_path = heatmap_base_path
+        self.use_heatmap = use_heatmap
 
     def run(self, src):
         for path in src:
@@ -145,12 +149,60 @@ class decode_videos_to_clips(wds.PipelineStage):
                 if self.transform is not None:
                     buffer = self.transform(buffer)
 
-                yield dict(
+                # Load gaze heatmap if enabled
+                heatmap = None
+                if self.use_heatmap and self.heatmap_base_path is not None:
+                    try:
+                        # Construct heatmap path: heatmap_base_path/video_id/frame_indices.npy
+                        # or heatmap_base_path/video_id.npz containing all frames
+                        heatmap_path = os.path.join(self.heatmap_base_path, video_id)
+                        if os.path.exists(heatmap_path + ".npz"):
+                            # Load from npz file
+                            heatmap_data = np.load(heatmap_path + ".npz")
+                            # Assume the key is 'heatmap' or similar
+                            heatmap_key = list(heatmap_data.keys())[0]
+                            all_heatmaps = heatmap_data[heatmap_key]
+                            # Extract heatmaps for the same frame indices
+                            # Ensure indices are within bounds
+                            valid_indices = np.clip(indices, 0, len(all_heatmaps) - 1)
+                            heatmap = all_heatmaps[valid_indices]
+                            # Ensure heatmap is [T, H, W] format
+                            if len(heatmap.shape) == 3 and heatmap.shape[0] == len(indices):
+                                pass  # Already correct shape
+                            elif len(heatmap.shape) == 4:
+                                # If [T, 1, H, W], squeeze channel dimension
+                                heatmap = heatmap.squeeze(1)
+                        elif os.path.isdir(heatmap_path):
+                            # Load individual frame heatmaps
+                            heatmap_frames = []
+                            for idx in indices:
+                                frame_heatmap_path = os.path.join(heatmap_path, f"frame_{idx:06d}.npy")
+                                if os.path.exists(frame_heatmap_path):
+                                    heatmap_frames.append(np.load(frame_heatmap_path))
+                                else:
+                                    # If frame not found, use zero heatmap
+                                    # You may need to adjust shape based on your heatmap format
+                                    heatmap_frames.append(np.zeros((224, 224), dtype=np.float32))
+                            heatmap = np.stack(heatmap_frames, axis=0)
+                        else:
+                            logging.info(f"Heatmap path not found: {heatmap_path}")
+                            # Create zero heatmap as fallback
+                            heatmap = np.zeros((len(indices), 224, 224), dtype=np.float32)
+                    except Exception as e:
+                        logging.info(f"Encountered exception loading heatmap {e=}")
+                        # Create zero heatmap as fallback
+                        heatmap = np.zeros((len(indices), 224, 224), dtype=np.float32)
+
+                output_dict = dict(
                     video=buffer,
                     verb=labels_verb,
                     noun=labels_noun,
                     anticipation_time=at,
                 )
+                if self.use_heatmap:
+                    output_dict["heatmap"] = heatmap
+                
+                yield output_dict
 
 
 class ResampledShards(IterableDataset):
@@ -185,18 +237,24 @@ def get_video_wds_dataset(
     num_workers=1,
     persistent_workers=True,
     pin_memory=True,
+    use_heatmap=False,
 ):
     assert input_shards is not None
     _, num_shards = get_dataset_size(input_shards)
     logging.info(f"Total number of shards across all data is {num_shards=}")
 
     epoch = SharedEpoch(epoch=epoch)
+    # Build tuple keys based on whether heatmap is used
+    tuple_keys = ["video", "verb", "noun", "anticipation_time"]
+    if use_heatmap:
+        tuple_keys.append("heatmap")
+    
     pipeline = [
         ResampledShards(input_shards, epoch=epoch, training=training),
         split_by_node(rank=rank, world_size=world_size),
         wds.split_by_worker,
         video_decoder,
-        wds.to_tuple("video", "verb", "noun", "anticipation_time"),
+        wds.to_tuple(*tuple_keys),
         wds.batched(batch_size, partial=True, collation_fn=torch.utils.data.default_collate),
     ]
     dataset = wds.DataPipeline(*pipeline)
@@ -289,6 +347,8 @@ def make_webvid(
     pin_memory=True,
     training=True,
     anticipation_point=[0.1, 0.1],
+    heatmap_base_path=None,
+    use_heatmap=False,
     **kwargs,
 ):
 
@@ -302,6 +362,8 @@ def make_webvid(
         transform=transform,
         anticipation_time_sec=anticipation_time_sec,
         anticipation_point=anticipation_point,
+        heatmap_base_path=heatmap_base_path,
+        use_heatmap=use_heatmap,
     )
 
     dataset, datainfo = get_video_wds_dataset(
@@ -315,6 +377,7 @@ def make_webvid(
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
         training=training,
+        use_heatmap=use_heatmap,
     )
 
     datainfo.dataloader.num_batches = num_clips // (world_size * batch_size)

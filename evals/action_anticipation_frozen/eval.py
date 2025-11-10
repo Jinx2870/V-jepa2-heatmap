@@ -34,6 +34,11 @@ from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -74,6 +79,21 @@ def main(args_eval, resume_preempt=False):
 
     args_exp = args_eval.get("experiment")
 
+    # -- W&B
+    wandb_cfg = args_exp.get("wandb", {}) if args_exp is not None else {}
+    use_wandb = wandb_cfg.get("enable", False)
+    wandb_project = wandb_cfg.get("project")
+    wandb_entity = wandb_cfg.get("entity")
+    wandb_run_name = wandb_cfg.get("name", eval_tag)
+    wandb_group = wandb_cfg.get("group")
+    wandb_tags = wandb_cfg.get("tags")
+    if isinstance(wandb_tags, str):
+        wandb_tags = [wandb_tags]
+    wandb_notes = wandb_cfg.get("notes")
+    wandb_run_id = wandb_cfg.get("id")
+    wandb_resume = wandb_cfg.get("resume", False)
+    wandb_run = None
+
     # -- CLASSIFIER
     args_classifier = args_exp.get("classifier")
     num_probe_blocks = args_classifier.get("num_probe_blocks", 1)
@@ -100,6 +120,9 @@ def main(args_eval, resume_preempt=False):
     motion_shift = args_data.get("motion_shift")
     reprob = args_data.get("reprob")
     random_resize_scale = args_data.get("random_resize_scale")
+    # -- / heatmap support
+    use_heatmap = args_data.get("use_heatmap", False)
+    heatmap_base_path = args_data.get("heatmap_base_path", None)
     # --
     train_annotations_path = args_data.get("dataset_train")
     val_annotations_path = args_data.get("dataset_val")
@@ -140,6 +163,26 @@ def main(args_eval, resume_preempt=False):
 
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
+
+    if use_wandb and rank == 0:
+        if wandb is None:
+            raise ImportError("wandb is not installed but wandb.enable=True. Please `pip install wandb` or disable wandb.")
+        wandb_init_kwargs = dict(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            group=wandb_group,
+            notes=wandb_notes,
+            config=args_eval,
+        )
+        if wandb_tags is not None:
+            wandb_init_kwargs["tags"] = wandb_tags
+        if wandb_run_id is not None:
+            wandb_init_kwargs["id"] = wandb_run_id
+        if wandb_resume:
+            wandb_init_kwargs["resume"] = "allow"
+        wandb_init_kwargs = {k: v for k, v in wandb_init_kwargs.items() if v is not None}
+        wandb_run = wandb.init(**wandb_init_kwargs)
 
     # -- log/checkpointing paths
     folder = os.path.join(pretrain_folder, "action_anticipation_frozen/")
@@ -253,6 +296,9 @@ def main(args_eval, resume_preempt=False):
         num_workers=num_workers,
         pin_mem=pin_mem,
         persistent_workers=False,
+        # -- / heatmap support
+        use_heatmap=use_heatmap,
+        heatmap_base_path=heatmap_base_path,
     )
     ipe = train_loader.num_batches
     logger.info(f"Dataloader created... iterations per epoch: {ipe}")
@@ -272,6 +318,9 @@ def main(args_eval, resume_preempt=False):
         num_workers=num_workers,
         pin_mem=pin_mem,
         persistent_workers=False,
+        # -- / heatmap support
+        use_heatmap=use_heatmap,
+        heatmap_base_path=heatmap_base_path,
     )
     val_ipe = val_loader.num_batches
     logger.info(f"Val dataloader created... iterations per epoch: {val_ipe}")
@@ -285,6 +334,33 @@ def main(args_eval, resume_preempt=False):
         use_bfloat16=use_bfloat16,
     )
     classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
+
+    def _to_float(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if value.numel() == 1:
+                value = value.item()
+            else:
+                value = value.cpu().numpy()
+        return float(value) if isinstance(value, (int, float, np.floating)) else value
+
+    def _flatten_metrics(prefix, metrics):
+        log_dict = {}
+        if metrics is None:
+            return log_dict
+        for key, val in metrics.items():
+            if isinstance(val, dict):
+                for sub_key, sub_val in val.items():
+                    try:
+                        log_dict[f"{prefix}/{key}_{sub_key}"] = _to_float(sub_val)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    log_dict[f"{prefix}/{key}"] = _to_float(val)
+                except Exception:
+                    pass
+        return log_dict
 
     # -- load training checkpoint
     start_epoch = 0
@@ -320,6 +396,8 @@ def main(args_eval, resume_preempt=False):
         logging.info(f"Epoch {epoch}")
 
         train_data_info.set_epoch(epoch)
+
+        train_metrics = None
 
         # report train action recognition (AR)
         if not val_only:
@@ -360,6 +438,20 @@ def main(args_eval, resume_preempt=False):
             action_classes=action_classes,
             criterion=criterion,
         )
+
+        if use_wandb and rank == 0:
+            log_payload = {"epoch": epoch + 1}
+            if train_metrics is not None:
+                log_payload.update(_flatten_metrics("train", train_metrics))
+            log_payload.update(_flatten_metrics("val", val_metrics))
+            for idx, opt in enumerate(optimizer):
+                try:
+                    lr_value = opt.param_groups[0]["lr"]
+                    log_payload[f"lr/optimizer_{idx}"] = lr_value
+                except (IndexError, KeyError):
+                    continue
+            wandb.log(log_payload, step=epoch + 1)
+
         if val_only:
             logger.info(
                 "val acc (v/n): %.1f%% (%.1f%% %.1f%%) "
@@ -373,6 +465,9 @@ def main(args_eval, resume_preempt=False):
                     val_metrics["noun"]["recall"],
                 )
             )
+            if wandb_run is not None:
+                wandb.finish()
+                wandb_run = None
             return
 
         if action_is_verb_noun:
@@ -440,6 +535,9 @@ def main(args_eval, resume_preempt=False):
 
         save_checkpoint(epoch + 1)
 
+    if wandb_run is not None:
+        wandb.finish()
+
 
 def train_one_epoch(
     action_is_verb_noun,
@@ -481,9 +579,22 @@ def train_one_epoch(
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
 
-            # Format of udata: ("video", "verb", "noun", "anticipation_time_sec")
+            # Format of udata: ("video", "verb", "noun", "anticipation_time_sec") or 
+            # ("video", "verb", "noun", "anticipation_time_sec", "heatmap") if use_heatmap
             clips = udata[0].to(device)
             anticipation_times = udata[-1].to(device)  # [B]
+            
+            # Extract heatmap if available
+            heatmap = None
+            if len(udata) > 4:  # heatmap is included
+                heatmap = udata[4].to(device)  # [B, T, H, W] or [B, T, 1, H, W]
+                # Ensure heatmap is float and properly shaped
+                if heatmap.dtype != torch.float32:
+                    heatmap = heatmap.float()
+                # If heatmap is [B, T, H, W], add channel dimension if needed
+                if len(heatmap.shape) == 4 and heatmap.shape[2] != 1:
+                    # Assume it's [B, T, H, W], model expects [B, T, H, W] or [B, T, 1, H, W]
+                    pass  # Keep as is, model will handle it
 
             if action_is_verb_noun:
                 # Map verb/nouns to unified class labels
@@ -507,6 +618,10 @@ def train_one_epoch(
 
             # Forward and prediction
             with torch.no_grad():
+                # Pass heatmap to model if available
+                if hasattr(model, 'forward') and 'heatmap' in model.forward.__code__.co_varnames:
+                    outputs = model(clips, anticipation_times, heatmap=heatmap)
+                else:
                 outputs = model(clips, anticipation_times)
             outputs = [c(outputs) for c in classifiers]
 
@@ -627,9 +742,22 @@ def validate(
             udata = next(_data_loader)
 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-            # Format of udata: ("video", "verb", "noun", "anticipation_time_sec")
+            # Format of udata: ("video", "verb", "noun", "anticipation_time_sec") or 
+            # ("video", "verb", "noun", "anticipation_time_sec", "heatmap") if use_heatmap
             clips = udata[0].to(device)
             anticipation_times = udata[-1].to(device)  # [B]
+            
+            # Extract heatmap if available
+            heatmap = None
+            if len(udata) > 4:  # heatmap is included
+                heatmap = udata[4].to(device)  # [B, T, H, W] or [B, T, 1, H, W]
+                # Ensure heatmap is float and properly shaped
+                if heatmap.dtype != torch.float32:
+                    heatmap = heatmap.float()
+                # If heatmap is [B, T, H, W], add channel dimension if needed
+                if len(heatmap.shape) == 4 and heatmap.shape[2] != 1:
+                    # Assume it's [B, T, H, W], model expects [B, T, H, W] or [B, T, 1, H, W]
+                    pass  # Keep as is, model will handle it
 
             if action_is_verb_noun:
                 # Map verb/nouns to unified class labels
@@ -648,6 +776,10 @@ def validate(
                 action_labels = torch.tensor(action_labels).to(device).to(_actions.dtype)
 
             # Forward and prediction
+            # Pass heatmap to model if available
+            if hasattr(model, 'forward') and 'heatmap' in model.forward.__code__.co_varnames:
+                outputs = model(clips, anticipation_times, heatmap=heatmap)
+            else:
             outputs = model(clips, anticipation_times)
             outputs = [c(outputs) for c in classifiers]
 
