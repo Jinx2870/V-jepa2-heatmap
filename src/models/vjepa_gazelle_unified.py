@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from src.models.vision_transformer import VisionTransformer
 from src.masks.utils import apply_masks
 from src.models.predictor import VisionTransformerPredictor
+from src.models.utils.modules import ACBlock, build_action_block_causal_attention_mask
 from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 
 
@@ -80,6 +81,7 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         pred_depth: int = 6,
         pred_embed_dim: int = 384,
         pred_num_heads: Optional[int] = None,
+        predictor_mode: str = "masked",  # "masked" (default) or "causal" (TF/AR)
         uniform_power: bool = False,
         use_sdpa: bool = False,
         use_rope: bool = False,
@@ -137,29 +139,60 @@ class VJEPAGazelleUnifiedModel(nn.Module):
 
         self.encoder = MultiSeqWrapper(encoder_backbone)
 
-        predictor_backbone = VisionTransformerPredictor(
-            img_size=img_size,
-            patch_size=patch_size,
-            num_frames=num_frames,
-            tubelet_size=tubelet_size,
-            embed_dim=self.encoder.backbone.embed_dim,
-            predictor_embed_dim=pred_embed_dim,
-            depth=pred_depth,
-            num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
-            uniform_power=uniform_power,
-            use_mask_tokens=use_mask_tokens,
-            num_mask_tokens=num_mask_tokens,
-            zero_init_mask_tokens=zero_init_mask_tokens,
-            use_rope=use_rope,
-            use_sdpa=use_sdpa,
-            use_silu=use_pred_silu,
-            wide_silu=wide_silu,
-            use_activation_checkpointing=use_activation_checkpointing,
-        )
+        predictor_mode = str(predictor_mode).lower().strip()
+        if predictor_mode not in ("masked", "causal"):
+            raise ValueError(f"Unknown predictor_mode={predictor_mode}. Expected 'masked' or 'causal'.")
+        self.predictor_mode = predictor_mode
+
+        # (A) Masked-token predictor (original V-JEPA style)
+        self.predictor = None
+        self.predictor_causal = None
+
+        if predictor_mode == "masked":
+            predictor_backbone = VisionTransformerPredictor(
+                img_size=img_size,
+                patch_size=patch_size,
+                num_frames=num_frames,
+                tubelet_size=tubelet_size,
+                embed_dim=self.encoder.backbone.embed_dim,
+                predictor_embed_dim=pred_embed_dim,
+                depth=pred_depth,
+                num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
+                uniform_power=uniform_power,
+                use_mask_tokens=use_mask_tokens,
+                num_mask_tokens=num_mask_tokens,
+                zero_init_mask_tokens=zero_init_mask_tokens,
+                use_rope=use_rope,
+                use_sdpa=use_sdpa,
+                use_silu=use_pred_silu,
+                wide_silu=wide_silu,
+                use_activation_checkpointing=use_activation_checkpointing,
+            )
         # Wrap predictor so it can accept Gazelle condition tokens.
-        self.predictor = _PredictorMultiSeqWrapperWithCondition(
-            _VisionTransformerPredictorWithCondition(predictor_backbone)
-        )
+            self.predictor = _PredictorMultiSeqWrapperWithCondition(
+                _VisionTransformerPredictorWithCondition(predictor_backbone)
+            )
+
+        # (B) Causal (TF/AR) predictor over the full token sequence (no actions/states),
+        # conditioned by Gazelle scene tokens (added in predictor-embed space).
+        # self.predictor_causal = None
+        if predictor_mode == "causal":
+            self.predictor_causal = _VisionTransformerPredictorCausalWithCondition(
+                img_size=img_size,
+                patch_size=patch_size,
+                num_frames=num_frames,
+                tubelet_size=tubelet_size,
+                embed_dim=self.encoder.backbone.embed_dim,
+                predictor_embed_dim=pred_embed_dim,
+                depth=pred_depth,
+                num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
+                uniform_power=uniform_power,
+                use_rope=use_rope,
+                use_sdpa=use_sdpa,
+                use_silu=use_pred_silu,
+                wide_silu=wide_silu,
+                use_activation_checkpointing=use_activation_checkpointing,
+            )
 
         # -----------------------
         # Gazelle
@@ -321,7 +354,12 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         scene = scene_tokens if scene_tokens is not None else self.gazelle_scene_tokens(frames)
         # Move to the same device as predictor params.
         # (We keep Gazelle itself frozen; projection is trainable.)
-        pred_dev = next(self.predictor.parameters()).device
+        if self.predictor is not None:
+            pred_dev = next(self.predictor.parameters()).device
+        elif self.predictor_causal is not None:
+            pred_dev = next(self.predictor_causal.parameters()).device
+        else:
+            pred_dev = next(self.parameters()).device
         scene = scene.to(pred_dev, non_blocking=True)
 
         B, T_g, HW_g, D_scene = scene.shape
@@ -372,6 +410,17 @@ class VJEPAGazelleUnifiedModel(nn.Module):
             )
 
         return cond_full
+
+    @torch.no_grad()
+    def gazelle_condition_tokens(self, frames: torch.Tensor) -> torch.Tensor:
+        """
+        Public helper: compute predictor-aligned Gazelle condition tokens.
+
+        Returns:
+          cond_full: [B, T_enc*HW, D_pred] where T_enc = T_frames//tubelet_size
+        """
+        scene_tokens = self.gazelle_scene_tokens(frames)
+        return self._prepare_gazelle_condition_for_predictor(frames, scene_tokens=scene_tokens)
 
     @torch.no_grad()
     def _gazelle_forward_scene_tokens(self, images: torch.Tensor) -> torch.Tensor:
@@ -451,6 +500,13 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         out["latent"] = latent
 
         # 2) predictor: latent tokens (+gazelle condition) -> predicted tokens
+        if self.predictor_mode != "masked":
+            raise RuntimeError(
+                "VJEPAGazelleUnifiedModel.forward() implements the masked-token API only. "
+                "For TF/AR training, construct the model with predictor_mode='causal' and call "
+                "`predictor_causal` (plus `gazelle_condition_tokens`) from your trainer."
+            )
+
         if masks_enc is not None and masks_pred is not None:
             # NOTE: VisionTransformerPredictor requires mask tokens when running masked prediction.
             # If constructed with use_mask_tokens=False, it will have num_mask_tokens=0 and crash.
@@ -475,6 +531,111 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         out["pred"] = pred
 
         return out
+
+
+class _VisionTransformerPredictorCausalWithCondition(nn.Module):
+    """
+    Causal predictor over full patch-token sequences (no action/state tokens).
+
+    This is conceptually the TF/AR predictor used in original V-JEPA AC training,
+    but without action/state/extrinsics. We keep the same *causal attention mask*
+    idea (like `ac_predictor.py`), and allow adding Gazelle condition tokens
+    (aligned to the same patch grid) in predictor-embed space.
+
+    Input/Output:
+      - input x: [B, N, D_enc], where N = T * (H_p*W_p)
+      - optional cond_full: [B, N, D_pred] (already projected to predictor dim)
+      - output: [B, N, D_enc]
+    """
+
+    def __init__(
+        self,
+        img_size: int,
+        patch_size: int,
+        num_frames: int,
+        tubelet_size: int,
+        embed_dim: int,
+        predictor_embed_dim: int,
+        depth: int,
+        num_heads: int,
+        uniform_power: bool = False,
+        use_rope: bool = True,
+        use_sdpa: bool = True,
+        use_silu: bool = False,
+        wide_silu: bool = True,
+        use_activation_checkpointing: bool = False,
+    ) -> None:
+        super().__init__()
+        self.img_height = int(img_size)
+        self.img_width = int(img_size)
+        self.patch_size = int(patch_size)
+        self.num_frames = int(num_frames)
+        self.tubelet_size = int(tubelet_size)
+        self.grid_height = self.img_height // self.patch_size
+        self.grid_width = self.img_width // self.patch_size
+        self.num_patches_per_t = int(self.grid_height * self.grid_width)
+        self.use_activation_checkpointing = bool(use_activation_checkpointing)
+        self.uniform_power = bool(uniform_power)
+
+        self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.predictor_blocks = nn.ModuleList(
+            [
+                ACBlock(
+                    use_rope=use_rope,
+                    grid_size=self.grid_height,
+                    dim=predictor_embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=4.0,
+                    qkv_bias=True,
+                    drop=0.0,
+                    attn_drop=0.0,
+                    drop_path=0.0,
+                    norm_layer=nn.LayerNorm,
+                    use_sdpa=use_sdpa,
+                    is_causal=False,  # we provide an explicit attn_mask
+                    wide_silu=wide_silu,
+                    act_layer=nn.SiLU if use_silu else nn.GELU,
+                )
+                for _ in range(int(depth))
+            ]
+        )
+        self.predictor_norm = nn.LayerNorm(predictor_embed_dim)
+        self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
+
+        # Precompute causal attention mask over token-time steps (tubelets)
+        grid_depth = self.num_frames // self.tubelet_size
+        self.attn_mask = build_action_block_causal_attention_mask(
+            grid_depth, self.grid_height, self.grid_width, add_tokens=0
+        )
+
+    def forward(self, x: torch.Tensor, cond_full: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f"Expected x [B,N,D], got {tuple(x.shape)}")
+        x = self.predictor_embed(x)
+        B, N, D = x.shape
+        if N % self.num_patches_per_t != 0:
+            raise ValueError(f"N={N} not divisible by num_patches_per_t={self.num_patches_per_t}")
+        T = N // self.num_patches_per_t
+
+        if cond_full is not None:
+            if cond_full.shape != (B, N, D):
+                raise ValueError(f"cond_full must be [B,N,D_pred] == {(B,N,D)}, got {tuple(cond_full.shape)}")
+            x = x + cond_full
+
+        # Causal attention mask sized to current sequence length
+        attn_mask = self.attn_mask[:N, :N].to(x.device, non_blocking=True)
+
+        for blk in self.predictor_blocks:
+            if self.use_activation_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    blk, x, None, attn_mask, T, self.grid_height, self.grid_width, 0, use_reentrant=False
+                )
+            else:
+                x = blk(x, mask=None, attn_mask=attn_mask, T=T, H=self.grid_height, W=self.grid_width, action_tokens=0)
+
+        x = self.predictor_norm(x)
+        x = self.predictor_proj(x)
+        return x
 
 
 class _VisionTransformerPredictorWithCondition(nn.Module):
