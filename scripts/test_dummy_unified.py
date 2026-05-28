@@ -3,11 +3,8 @@
 Smoke-test for VJEPAGazelleUnifiedModel with dummy video input.
 
 Examples:
-  # Encoder only (no masks -> no predictor), skip Gazelle init:
+  # Encoder + causal predictor, skip Gazelle init:
   python scripts/test_dummy_unified.py --device cpu
-
-  # Encoder + predictor (with dummy masks), skip Gazelle init:
-  python scripts/test_dummy_unified.py --device cuda --with-predictor
 
   # If you want to actually init Gazelle (requires dinov2 download + checkpoint):
   python scripts/test_dummy_unified.py --init-gazelle \
@@ -21,7 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Tuple
+from typing import Optional
 
 import torch
 
@@ -37,18 +34,6 @@ def _ensure_importable() -> None:
         sys.path.insert(0, root)
 
 
-def _make_disjoint_masks(B: int, N: int, k_ctxt: int, k_pred: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    k_ctxt = min(k_ctxt, N)
-    k_pred = min(k_pred, max(0, N - k_ctxt))
-    enc = []
-    pred = []
-    for _ in range(B):
-        perm = torch.randperm(N, device=device)
-        enc.append(perm[:k_ctxt])
-        pred.append(perm[k_ctxt : k_ctxt + k_pred])
-    return torch.stack(enc, dim=0).long(), torch.stack(pred, dim=0).long()
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
@@ -56,7 +41,6 @@ def main() -> None:
     p.add_argument("--T", type=int, default=16)
     p.add_argument("--H", type=int, default=256)
     p.add_argument("--W", type=int, default=256)
-    p.add_argument("--with-predictor", action="store_true")
     p.add_argument("--patch-size", type=int, default=16)
     p.add_argument("--tubelet-size", type=int, default=2)
     p.add_argument("--dtype", default="float32", choices=["float32", "uint8"])
@@ -95,8 +79,6 @@ def main() -> None:
         patch_size=args.patch_size,
         num_frames=args.T,
         tubelet_size=args.tubelet_size,
-        use_mask_tokens=bool(args.with_predictor),
-        num_mask_tokens=2,
         gazelle_cfg=gazelle_cfg,
         init_gazelle=bool(args.init_gazelle),
     ).to(dev)
@@ -118,43 +100,26 @@ def main() -> None:
     else:
         frames = torch.rand((args.B, 3, args.T, args.H, args.W), dtype=torch.float32, device=dev)
 
-    masks_enc = masks_pred = None
-    if args.with_predictor:
-        T_enc = max(1, args.T // args.tubelet_size)
-        H_p = args.H // args.patch_size
-        W_p = args.W // args.patch_size
-        N = T_enc * H_p * W_p
-        # keep ~50% as context, predict ~25%
-        k_ctxt = max(1, N // 2)
-        k_pred = max(1, N // 4)
-        mask_enc, mask_pred = _make_disjoint_masks(args.B, N, k_ctxt, k_pred, device=dev)
-        # MultiSeqWrapper expects: list (per-clip) of list (per-multimask) of [B,K] index tensors
-        masks_enc = [[mask_enc]]
-        masks_pred = [[mask_pred]]
-
     with torch.no_grad():
         out = model(
             frames=frames,
-            masks_enc=masks_enc,
-            masks_pred=masks_pred,
             use_gazelle_condition=bool(args.init_gazelle),  # only condition if gazelle is initialized
         )
 
     latent = out["latent"]
     pred = out["pred"]
+    cond_full: Optional[torch.Tensor] = out.get("cond_full", None)
 
     def _shape(x):
         if x is None:
             return None
         if isinstance(x, torch.Tensor):
             return tuple(x.shape)
-        if isinstance(x, list):
-            # list-of-(list-of-tensors) in multiseq mode, or list-of-tensors in no-mask mode
-            return [ _shape(xx) for xx in x ]
         return type(x)
 
     print("frames:", tuple(frames.shape), frames.dtype, frames.device)
     print("latent:", _shape(latent))
+    print("cond_full:", _shape(cond_full))
     print("pred:", _shape(pred))
 
 

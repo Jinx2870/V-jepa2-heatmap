@@ -1,6 +1,6 @@
 app: vjepa_ego4d_gaze_unified
 cpus_per_task: 12
-folder: /data3/lg2/human_wm/V-jepa2-heatmap-new/logs/ego4d-heatmap-online-256px-gazelle224-grid16-n
+folder: /data3/lg2/human_wm/V-jepa2-heatmap-new/logs/ego4d-heatmap-online-256px-gazelle224-grid16-64f
 mem_per_gpu: 220G
 nodes: 1
 tasks_per_node: 2
@@ -12,7 +12,7 @@ data:
   datasets:
     - /data3/lg2/human_wm/Ego4d/test/output2.txt
   dataset_fpcs:
-    - 16
+    - 64
   fps: 8
   num_workers: 12
   patch_size: 16
@@ -35,10 +35,10 @@ data:
     fps: 8
     tubelet_size: 2
     deterministic_sampling: true
-    # 取消 max_iters，每次验证跑完整个 val set
-    log_freq: 100   # 每 100 个 batch 打印一次进度（全量 val 时避免刷屏）
+    max_iters: 20
+    log_freq: 10
     dataset_fpcs:
-      - 16
+      - 64
     datasets:
       - /data3/lg2/human_wm/Ego4d/test/output2.txt
     gazelle:
@@ -79,7 +79,7 @@ loss:
 
 meta:
   dtype: float16
-  eval_freq: 10   # 每 10 个 epoch 验证一次
+  eval_freq: 5
   resume_checkpoint: null
   load_predictor: false
   pretrain_checkpoint: /data3/lg2/human_wm/V-jepa2-heatmap/features/vitl.pt #/data3/lg2/human_wm/V-jepa2-heatmap/logs/ego4d-heatmap-online/latest.pt
@@ -92,7 +92,7 @@ meta:
     enable: true
     project: vjepa2-heatmap
     entity:
-    name: heatmap-online-256px-gazelle224-grid16
+    name: heatmap-online-256px-gazelle224-grid16-64f
     group: online
     tags:
       - heatmap
@@ -100,7 +100,8 @@ meta:
       - 256px
       - gazelle224
       - grid16
-    notes: "Gazelle forced to 224 input => 16x16 scene tokens; V-JEPA2 crop_size=256 => 16x16 patches."
+      - 64f
+    notes: "64f pretrain. Gazelle forced to 224 input => 16x16 scene tokens; V-JEPA2 crop_size=256 => 16x16 patches. With tubelet_size=2: T_enc=32, N_tokens=32*16*16=8192."
 
 model:
   condition_mode: gazelle
@@ -121,15 +122,15 @@ model:
     scene_token_grid: 16
 
 optimization:
-  anneal: 0   # 0 => WarmupCosineSchedule (cosine decay 全程); >0 => 恒定 lr 再最后线性 anneal
+  anneal: 10
   epochs: 1000
   final_lr: 0.0
   final_weight_decay: 0.04
-  grad_clip: 3.0   # 梯度裁剪，稳定训练；设为 null 可关闭
   ipe:
   lr: 0.0002
   start_lr: 0.00005
   warmup: 5
   weight_decay: 0.04
+
 
 

@@ -10,6 +10,22 @@ import pprint
 
 import yaml
 
+def _ensure_repo_root_on_path() -> None:
+    """
+    Allow running this file directly:
+      python evals/main.py --fname ...
+    Without requiring `PYTHONPATH=.` or `python -m evals.main`.
+    """
+    import sys
+
+    here = os.path.abspath(os.path.dirname(__file__))
+    repo_root = os.path.abspath(os.path.join(here, ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+_ensure_repo_root_on_path()
+
 from evals.scaffold import main as eval_main
 from src.utils.distributed import init_distributed
 

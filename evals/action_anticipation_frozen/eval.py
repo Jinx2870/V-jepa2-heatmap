@@ -108,8 +108,30 @@ def main(args_eval, resume_preempt=False):
     # --
     train_annotations_path = args_data.get("dataset_train")
     val_annotations_path = args_data.get("dataset_val")
+    # -- optional: restrict to a predefined list of Ego4D mp4s/takes (e.g. same set as gaze pretrain)
+    video_list_file = args_data.get("video_list_file", None)
     train_data_path = base_path  # os.path.join(base_path, "train")
     val_data_path = base_path  # os.path.join(base_path, "test")
+
+    # ----------------------------------------------------------------------- #
+    # Strict shape guardrails for gaze-conditioned e1000.pt checkpoint
+    # (Fail early before launching distributed workers.)
+    # ----------------------------------------------------------------------- #
+    if (
+        dataset == "EGO4D_KEYSTEP"
+        and isinstance(module_name, str)
+        and "vit_encoder_predictor_concat_ar_gazelle" in module_name
+        and isinstance(checkpoint, str)
+        and checkpoint.endswith("e1000.pt")
+    ):
+        if int(resolution) != 256:
+            raise ValueError(
+                f"[ShapeGuard] resolution must be 256 for e1000.pt (patch_size=16 => 16x16 grid). Got {resolution}."
+            )
+        if int(frames_per_clip) != 16:
+            raise ValueError(
+                f"[ShapeGuard] frames_per_clip must be 16 for e1000.pt (tubelet_size=2 => T_enc=8). Got {frames_per_clip}."
+            )
 
     # -- OPTIMIZATION
     args_opt = args_exp.get("optimization")
@@ -219,6 +241,7 @@ def main(args_eval, resume_preempt=False):
         train_annotations_path,
         val_annotations_path,
         file_format=file_format,
+        video_list_file=video_list_file,
     )
     action_classes = _annotations["actions"]
     verb_classes = {}
@@ -472,24 +495,18 @@ def main(args_eval, resume_preempt=False):
                         "train/action_recall": train_metrics["action"]["recall"],
                         "train/verb_recall": train_metrics["verb"]["recall"],
                         "train/noun_recall": train_metrics["noun"]["recall"],
-                        "val/action_accuracy": val_metrics["action"]["accuracy"],
-                        "val/verb_accuracy": val_metrics["verb"]["accuracy"],
-                        "val/noun_accuracy": val_metrics["noun"]["accuracy"],
-                        "val/action_recall": val_metrics["action"]["recall"],
-                        "val/verb_recall": val_metrics["verb"]["recall"],
-                        "val/noun_recall": val_metrics["noun"]["recall"],
                     }
                     if train_loss_epoch is not None:
                         metrics["train/loss_epoch"] = train_loss_epoch
-                    if val_loss_epoch is not None:
-                        metrics["val/loss_epoch"] = val_loss_epoch
                     # log learning rate (use first optimizer's first param group)
                     try:
                         lr = optimizer[0].param_groups[0]["lr"]
                         metrics["train/lr"] = float(lr)
                     except Exception:
                         pass
-                    wandb_logger.log(metrics, step=epoch + 1)
+                    # Train metrics use global step (monotonic). Do NOT use step=epoch+1 here.
+                    train_step_end = int(epoch + 1) * int(ipe)
+                    wandb_logger.log(metrics, step=train_step_end)
         else:
             logger.info(
                 "[%5d] "
@@ -518,19 +535,16 @@ def main(args_eval, resume_preempt=False):
                         "epoch": epoch + 1,
                         "train/action_accuracy": train_metrics["action"]["accuracy"],
                         "train/action_recall": train_metrics["action"]["recall"],
-                        "val/action_accuracy": val_metrics["action"]["accuracy"],
-                        "val/action_recall": val_metrics["action"]["recall"],
                     }
                     if train_loss_epoch is not None:
                         metrics["train/loss_epoch"] = train_loss_epoch
-                    if val_loss_epoch is not None:
-                        metrics["val/loss_epoch"] = val_loss_epoch
                     try:
                         lr = optimizer[0].param_groups[0]["lr"]
                         metrics["train/lr"] = float(lr)
                     except Exception:
                         pass
-                    wandb_logger.log(metrics, step=epoch + 1)
+                    train_step_end = int(epoch + 1) * int(ipe)
+                    wandb_logger.log(metrics, step=train_step_end)
 
         save_checkpoint(epoch + 1)
     
@@ -791,7 +805,7 @@ def validate(
     wandb_logger=None,
     epoch=None,
 ):
-    logger.info("Running val...")
+    logger.info("Start Validation...")
     _data_loader = iter(data_loader)
     for c in classifiers:
         c.train(mode=False)
@@ -855,78 +869,46 @@ def validate(
                 verb_metrics = [m(o["verb"], verb_labels) for o, m in zip(outputs, verb_metric_loggers)]
                 noun_metrics = [m(o["noun"], noun_labels) for o, m in zip(outputs, noun_metric_loggers)]
 
-        if itr % 10 == 0 or itr == ipe - 1:
-            if action_is_verb_noun:
-                logger.info(
-                    "[%5d] "
-                    "acc (v/n): %.1f%% (%.1f%% %.1f%%) "
-                    "recall (v/n): %.1f%% (%.1f%% %.1f%%) "
-                    "loss (v/n): %.3f (%.3f %.3f) "
-                    "[mem: %.2e] "
-                    % (
-                        itr,
-                        max([a["accuracy"] for a in action_metrics]),
-                        max([v["accuracy"] for v in verb_metrics]),
-                        max([n["accuracy"] for n in noun_metrics]),
-                        max([a["recall"] for a in action_metrics]),
-                        max([v["recall"] for v in verb_metrics]),
-                        max([n["recall"] for n in noun_metrics]),
-                        loss,
-                        verb_loss,
-                        noun_loss,
-                        torch.cuda.max_memory_allocated() / 1024.0**2,
-                    )
-                )
-                # -- wandb iterative logging for val losses
-                if wandb_logger is not None and epoch is not None:
-                    try:
-                        step = int(epoch) * int(ipe) + int(itr)
-                        wandb_logger.log(
-                            {
-                                "val/iter_loss": float(loss.detach().cpu()),
-                                "val/iter_loss_action": float(action_loss.detach().cpu()),
-                                "val/iter_loss_verb": float(verb_loss.detach().cpu()),
-                                "val/iter_loss_noun": float(noun_loss.detach().cpu()),
-                            },
-                            step=step,
-                        )
-                    except Exception:
-                        pass
-            else:
-                logger.info(
-                    "[%5d] "
-                    "acc (v/n): %.1f%% "
-                    "recall (v/n): %.1f%% "
-                    "loss (v/n): %.3f "
-                    "[mem: %.2e] "
-                    % (
-                        itr,
-                        max([a["accuracy"] for a in action_metrics]),
-                        max([a["recall"] for a in action_metrics]),
-                        loss,
-                        torch.cuda.max_memory_allocated() / 1024.0**2,
-                    )
-                )
-                if wandb_logger is not None and epoch is not None:
-                    try:
-                        step = int(epoch) * int(ipe) + int(itr)
-                        wandb_logger.log(
-                            {
-                                "val/iter_loss": float(loss.detach().cpu()),
-                            },
-                            step=step,
-                        )
-                    except Exception:
-                        pass
-
     del _data_loader
     val_loss_epoch = None
     if epoch_loss_count > 0:
         val_loss_epoch = epoch_loss_sum / epoch_loss_count
+
+    # Final val metrics (epoch-level; note metric loggers accumulate TP/FN across the whole loop)
+    val_action_acc = max([a["accuracy"] for a in action_metrics])
+    val_action_recall = max([a["recall"] for a in action_metrics])
+    if epoch is not None:
+                logger.info(
+            "Validation done (epoch=%d): Val Acc=%.1f%%  Val Mean Recall=%.1f%%"
+            % (int(epoch) + 1, val_action_acc, val_action_recall)
+        )
+    else:
+        logger.info("Validation done: Val Acc=%.1f%%  Val Mean Recall=%.1f%%" % (val_action_acc, val_action_recall))
+
+    # W&B: validation uses epoch axis (val/* is defined with step_metric='epoch')
+    if wandb_logger is not None and epoch is not None:
+        payload = {
+            "epoch": int(epoch) + 1,
+            "val/action_accuracy": float(val_action_acc),
+            "val/action_recall": float(val_action_recall),
+        }
+        if val_loss_epoch is not None:
+            payload["val/loss_epoch"] = float(val_loss_epoch)
+        if action_is_verb_noun:
+            payload.update(
+                {
+                    "val/verb_accuracy": float(max([v["accuracy"] for v in verb_metrics])),
+                    "val/verb_recall": float(max([v["recall"] for v in verb_metrics])),
+                    "val/noun_accuracy": float(max([n["accuracy"] for n in noun_metrics])),
+                    "val/noun_recall": float(max([n["recall"] for n in noun_metrics])),
+                }
+            )
+        wandb_logger.log(payload, step=None)
+
     ret = dict(
         action=dict(
-            accuracy=max([a["accuracy"] for a in action_metrics]),
-            recall=max([a["recall"] for a in action_metrics]),
+            accuracy=val_action_acc,
+            recall=val_action_recall,
         ),
     )
     if val_loss_epoch is not None:

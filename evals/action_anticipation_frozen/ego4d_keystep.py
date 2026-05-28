@@ -56,6 +56,7 @@ def filter_annotations(
     train_annotations_path: str,
     val_annotations_path: str,
     camera_glob: str = "aria01*.mp4",
+    video_list_file: str = None,
     **kwargs,
 ) -> Dict:
     """Build action class space and per-take segment annotations for KeyStep.
@@ -88,11 +89,45 @@ def filter_annotations(
     # Use string keys to match downstream lookup in eval loop
     action_classes = {str(uid): idx for idx, uid in enumerate(train_unique)}
 
+    # Optional: restrict to a predefined list of videos (absolute mp4 paths).
+    # We derive a mapping take_name -> preferred video paths, so the selected camera view
+    # matches the list (e.g. the same view used during gaze pretraining).
+    preferred_videos = None
+    if video_list_file:
+        try:
+            df_list = pd.read_csv(video_list_file, header=None)
+            mp4s = list(df_list.iloc[:, 0].astype(str).values)
+            preferred_videos = {}
+            for p in mp4s:
+                parts = str(p).split(os.sep)
+                if "takes" in parts:
+                    i = parts.index("takes")
+                    if i + 1 < len(parts):
+                        take = parts[i + 1]
+                        preferred_videos.setdefault(take, []).append(str(p))
+        except Exception as e:
+            logger.info(f"failed to read/parse video_list_file={video_list_file}: {e}")
+            preferred_videos = None
+
     def build_index(obj) -> Tuple[List[str], Dict[str, pd.DataFrame]]:
         paths, annos = [], {}
         for take in obj.get("annotations", {}).values():
             take_name = take.get("take_name")
-            vpath = _find_video_for_take(base_path, take_name, camera_glob)
+            if preferred_videos is not None:
+                # If a list is provided, only keep takes that are in the list.
+                if take_name not in preferred_videos:
+                    continue
+                # Prefer the exact camera path from the list if it exists.
+                vpath = None
+                for cand in preferred_videos.get(take_name, []):
+                    if cand and os.path.exists(cand):
+                        vpath = cand
+                        break
+                if vpath is None:
+                    # fallback to resolving under base_path (should be rare)
+                    vpath = _find_video_for_take(base_path, take_name, camera_glob)
+            else:
+                vpath = _find_video_for_take(base_path, take_name, camera_glob)
             if vpath is None or (not os.path.exists(vpath)):
                 logger.info(f"video not found for {take_name=}")
                 continue
@@ -123,6 +158,12 @@ def filter_annotations(
 
     train_paths, train_annos = build_index(tr)
     val_paths, val_annos = build_index(va)
+
+    if preferred_videos is not None:
+        logger.info(
+            f"Applied video_list_file filter: train_paths={len(train_paths)} val_paths={len(val_paths)} "
+            f"(takes_in_list={len(preferred_videos)})"
+        )
 
     val_action_classes = set()
     for df in val_annos.values():

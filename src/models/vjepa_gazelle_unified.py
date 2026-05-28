@@ -10,11 +10,10 @@ Design goals (future refactor):
   - Training code calls ONE model, not encoder/predictor/gazelle separately.
   - Model internally performs:
       encoder: frames -> latent tokens
-      predictor: latent tokens -> future tokens (masked-token prediction)
-      gazelle: frames -> gaze/scene tokens
+      predictor: latent tokens -> future tokens (TF/AR causal prediction)
+      gazelle: frames -> gaze/scene tokens (used only as conditioning signal)
 
 Current repo state:
-  - V-JEPA pretraining uses MultiSeq wrappers and mask indices.
   - Gazelle code lives outside this repo (e.g., /data3/lg2/human_wm/gazelle).
 
 This module is VIDEO-ONLY:
@@ -34,10 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.vision_transformer import VisionTransformer
-from src.masks.utils import apply_masks
-from src.models.predictor import VisionTransformerPredictor
 from src.models.utils.modules import ACBlock, build_action_block_causal_attention_mask
-from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
+from src.utils.wrappers import MultiSeqWrapper
 
 
 @dataclass(frozen=True)
@@ -59,7 +56,7 @@ class VJEPAGazelleUnifiedModel(nn.Module):
     """
     A single nn.Module that owns:
       - V-JEPA2 encoder (MultiSeq-wrapped VisionTransformer)
-      - V-JEPA2 predictor (PredictorMultiSeqWrapper around VisionTransformerPredictor)
+      - V-JEPA2 causal predictor (TF/AR over full token sequence)
       - Gazelle scene-token extractor (eager init in __init__)
 
     Notes:
@@ -81,7 +78,6 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         pred_depth: int = 6,
         pred_embed_dim: int = 384,
         pred_num_heads: Optional[int] = None,
-        predictor_mode: str = "masked",  # "masked" (default) or "causal" (TF/AR)
         uniform_power: bool = False,
         use_sdpa: bool = False,
         use_rope: bool = False,
@@ -89,9 +85,6 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         use_pred_silu: bool = False,
         wide_silu: bool = True,
         use_activation_checkpointing: bool = False,
-        use_mask_tokens: bool = False,
-        num_mask_tokens: int = 2,
-        zero_init_mask_tokens: bool = True,
         # Gazelle config
         gazelle_cfg: Optional[GazelleConfig] = None,
         # For quick smoke tests (and for environments without Gazelle deps / checkpoints),
@@ -139,60 +132,24 @@ class VJEPAGazelleUnifiedModel(nn.Module):
 
         self.encoder = MultiSeqWrapper(encoder_backbone)
 
-        predictor_mode = str(predictor_mode).lower().strip()
-        if predictor_mode not in ("masked", "causal"):
-            raise ValueError(f"Unknown predictor_mode={predictor_mode}. Expected 'masked' or 'causal'.")
-        self.predictor_mode = predictor_mode
-
-        # (A) Masked-token predictor (original V-JEPA style)
-        self.predictor = None
-        self.predictor_causal = None
-
-        if predictor_mode == "masked":
-            predictor_backbone = VisionTransformerPredictor(
-                img_size=img_size,
-                patch_size=patch_size,
-                num_frames=num_frames,
-                tubelet_size=tubelet_size,
-                embed_dim=self.encoder.backbone.embed_dim,
-                predictor_embed_dim=pred_embed_dim,
-                depth=pred_depth,
-                num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
-                uniform_power=uniform_power,
-                use_mask_tokens=use_mask_tokens,
-                num_mask_tokens=num_mask_tokens,
-                zero_init_mask_tokens=zero_init_mask_tokens,
-                use_rope=use_rope,
-                use_sdpa=use_sdpa,
-                use_silu=use_pred_silu,
-                wide_silu=wide_silu,
-                use_activation_checkpointing=use_activation_checkpointing,
-            )
-        # Wrap predictor so it can accept Gazelle condition tokens.
-            self.predictor = _PredictorMultiSeqWrapperWithCondition(
-                _VisionTransformerPredictorWithCondition(predictor_backbone)
-            )
-
-        # (B) Causal (TF/AR) predictor over the full token sequence (no actions/states),
+        # Causal (TF/AR) predictor over the full token sequence (no actions/states),
         # conditioned by Gazelle scene tokens (added in predictor-embed space).
-        # self.predictor_causal = None
-        if predictor_mode == "causal":
-            self.predictor_causal = _VisionTransformerPredictorCausalWithCondition(
-                img_size=img_size,
-                patch_size=patch_size,
-                num_frames=num_frames,
-                tubelet_size=tubelet_size,
-                embed_dim=self.encoder.backbone.embed_dim,
-                predictor_embed_dim=pred_embed_dim,
-                depth=pred_depth,
-                num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
-                uniform_power=uniform_power,
-                use_rope=use_rope,
-                use_sdpa=use_sdpa,
-                use_silu=use_pred_silu,
-                wide_silu=wide_silu,
-                use_activation_checkpointing=use_activation_checkpointing,
-            )
+        self.predictor_causal = _VisionTransformerPredictorCausalWithCondition(
+            img_size=img_size,
+            patch_size=patch_size,
+            num_frames=num_frames,
+            tubelet_size=tubelet_size,
+            embed_dim=self.encoder.backbone.embed_dim,
+            predictor_embed_dim=pred_embed_dim,
+            depth=pred_depth,
+            num_heads=self.encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads,
+            uniform_power=uniform_power,
+            use_rope=use_rope,
+            use_sdpa=use_sdpa,
+            use_silu=use_pred_silu,
+            wide_silu=wide_silu,
+            use_activation_checkpointing=use_activation_checkpointing,
+        )
 
         # -----------------------
         # Gazelle
@@ -354,12 +311,7 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         scene = scene_tokens if scene_tokens is not None else self.gazelle_scene_tokens(frames)
         # Move to the same device as predictor params.
         # (We keep Gazelle itself frozen; projection is trainable.)
-        if self.predictor is not None:
-            pred_dev = next(self.predictor.parameters()).device
-        elif self.predictor_causal is not None:
-            pred_dev = next(self.predictor_causal.parameters()).device
-        else:
-            pred_dev = next(self.parameters()).device
+        pred_dev = next(self.predictor_causal.parameters()).device
         scene = scene.to(pred_dev, non_blocking=True)
 
         B, T_g, HW_g, D_scene = scene.shape
@@ -463,9 +415,6 @@ class VJEPAGazelleUnifiedModel(nn.Module):
     def forward(
         self,
         frames: torch.Tensor,
-        masks_enc: Optional[List[torch.Tensor]] = None,
-        masks_pred: Optional[List[torch.Tensor]] = None,
-        mask_index: int = 1,
         use_gazelle_condition: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -474,60 +423,31 @@ class VJEPAGazelleUnifiedModel(nn.Module):
         Video-only API.
 
         - `frames` must be a 5D tensor [B, C, T, H, W]. In your setup H=W=256.
-        - If masks are provided, predictor will be run. If not, only encoder + gazelle are run.
-
-        Returns :
+        Returns:
             dict with keys:
-              - "latent": encoder tokens (MultiSeq format)
-              - "pred": predictor output tokens (MultiSeq format) or None
+              - "latent": encoder tokens [B, N, D]
+              - "cond_full": Gazelle condition tokens aligned to patch grid [B, N, D_pred] (or None)
+              - "pred": predictor output tokens [B, N, D]
         """
         if not torch.is_tensor(frames) or frames.dim() != 5:
             raise ValueError(f"`frames` must be a 5D torch.Tensor [B,C,T,H,W], got {type(frames)} {getattr(frames,'shape',None)}")
 
-        # Wrap into a 1-element MultiSeq list (what wrappers expect internally).
-        clips: List[torch.Tensor] = [frames]
-
         out: Dict[str, Any] = {}
 
-        # 1) encoder: frames -> latent tokens (MultiSeq)
-        # MultiSeqWrapper expects `encoder(clips, masks_enc)` where masks_enc is list-of-list.
-        if masks_enc is None:
-            # If masks are not provided, default to "no masking": encode full tokens.
-            # MultiSeqWrapper accepts `masks=None` and returns a list of tokens.
-            latent = self.encoder(clips, None)
-        else:
-            latent = self.encoder(clips, masks_enc)
+        # 1) encoder: frames -> latent tokens
+        latent = self.encoder.backbone(frames)  # [B, N, D_enc]
         out["latent"] = latent
 
-        # 2) predictor: latent tokens (+gazelle condition) -> predicted tokens
-        if self.predictor_mode != "masked":
-            raise RuntimeError(
-                "VJEPAGazelleUnifiedModel.forward() implements the masked-token API only. "
-                "For TF/AR training, construct the model with predictor_mode='causal' and call "
-                "`predictor_causal` (plus `gazelle_condition_tokens`) from your trainer."
-            )
+        # 2) optional Gazelle condition (aligned to predictor patch grid)
+        cond_full = None
+        if use_gazelle_condition:
+            # 只 forward 一次 Gazelle：这里算好 scene tokens，后续仅做投影/reshape。
+            scene_tokens = self.gazelle_scene_tokens(frames)
+            cond_full = self._prepare_gazelle_condition_for_predictor(frames, scene_tokens=scene_tokens)
+        out["cond_full"] = cond_full
 
-        if masks_enc is not None and masks_pred is not None:
-            # NOTE: VisionTransformerPredictor requires mask tokens when running masked prediction.
-            # If constructed with use_mask_tokens=False, it will have num_mask_tokens=0 and crash.
-            try:
-                num_mask_tokens = int(self.predictor.backbone.backbone.num_mask_tokens)  # type: ignore[attr-defined]
-            except Exception:
-                num_mask_tokens = 0
-            if num_mask_tokens <= 0:
-                raise ValueError(
-                    "Predictor path requires mask tokens, but predictor.num_mask_tokens==0. "
-                    "Please construct VJEPAGazelleUnifiedModel with use_mask_tokens=True (and num_mask_tokens>=1), "
-                    "or call forward() without masks_enc/masks_pred."
-                )
-            cond_full = None
-            if use_gazelle_condition:
-                # 只 forward 一次 Gazelle：这里算好 scene tokens，后续仅做投影/reshape。
-                scene_tokens = self.gazelle_scene_tokens(frames)
-                cond_full = self._prepare_gazelle_condition_for_predictor(frames, scene_tokens=scene_tokens)
-            pred = self.predictor(latent, masks_enc, masks_pred, cond_full=cond_full)
-        else:
-            pred = None
+        # 3) predictor: TF/AR causal over full token sequence
+        pred = self.predictor_causal(latent, cond_full=cond_full)
         out["pred"] = pred
 
         return out
@@ -636,145 +556,5 @@ class _VisionTransformerPredictorCausalWithCondition(nn.Module):
         x = self.predictor_norm(x)
         x = self.predictor_proj(x)
         return x
-
-
-class _VisionTransformerPredictorWithCondition(nn.Module):
-    """
-    Thin wrapper that adds an optional condition token stream to the *context* tokens
-    before running the standard V-JEPA predictor.
-    """
-
-    def __init__(self, backbone: VisionTransformerPredictor):
-        super().__init__()
-        self.backbone = backbone
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        masks_x: torch.Tensor,
-        masks_y: torch.Tensor,
-        mask_index: int = 1,
-        has_cls: bool = False,
-        cond_full: Optional[torch.Tensor] = None,  # [B, num_patches, D_pred]
-    ) -> torch.Tensor:
-        """
-        Same as VisionTransformerPredictor.forward, but if cond_full is provided we add:
-            x_context += apply_masks(cond_full, masks_x)
-        in predictor-embed space.
-        """
-        # Mirror the original forward, adding a single line for conditioning.
-        b = self.backbone
-
-        if not isinstance(masks_x, list):
-            masks_x = [masks_x]
-        if not isinstance(masks_y, list):
-            masks_y = [masks_y]
-
-        B = len(x) // len(masks_x)
-
-        # Map context tokens to predictor dimensions
-        x = b.predictor_embed(x)
-        if has_cls:
-            x_cls = x[:, :1, :]
-            x = x[:, 1:, :]
-        _, N_ctxt, D = x.shape
-
-        # Add positional embedding to ctxt tokens
-        if not b.use_rope:
-            x_pos_embed = b.predictor_pos_embed.repeat(B, 1, 1)
-            x = x + apply_masks(x_pos_embed, masks_x)
-
-        # Add Gazelle condition to ctxt tokens (aligned to full patch grid, then masked to ctxt indices)
-        if cond_full is not None:
-            if cond_full.dim() != 3:
-                raise ValueError(f"cond_full must be [B, N_patches, D], got {tuple(cond_full.shape)}")
-            if cond_full.size(0) != B:
-                raise ValueError(f"cond_full batch={cond_full.size(0)} != B={B}")
-            # Match predictor embed dim
-            if cond_full.size(-1) != D:
-                raise ValueError(f"cond_full dim={cond_full.size(-1)} != predictor_embed_dim={D}")
-            x = x + apply_masks(cond_full, masks_x)
-
-        # Make target tokens
-        mask_index = mask_index % b.num_mask_tokens
-        pred_tokens = b.mask_tokens[mask_index]
-        pred_tokens = pred_tokens.repeat(B, b.num_patches, 1)
-        pred_tokens = apply_masks(pred_tokens, masks_y)
-        # -- add pos embed
-        if not b.use_rope:
-            pos_embs = b.predictor_pos_embed.repeat(B, 1, 1)
-            pos_embs = apply_masks(pos_embs, masks_y)
-            from src.utils.tensors import repeat_interleave_batch
-
-            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
-            pred_tokens = pred_tokens + pos_embs
-
-        # Concatenate context & target tokens
-        x = x.repeat(len(masks_x), 1, 1)
-        x = torch.cat([x, pred_tokens], dim=1)
-
-        # Positions of context & target tokens
-        masks_x_cat = torch.cat(masks_x, dim=0)
-        masks_y_cat = torch.cat(masks_y, dim=0)
-        masks = torch.cat([masks_x_cat, masks_y_cat], dim=1)
-
-        # Put tokens in sorted order
-        argsort = torch.argsort(masks, dim=1)
-        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
-        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
-
-        # Remove the last n tokens of sorted sequence before processing
-        if getattr(b, "chop_last_n_tokens", 0) > 0:
-            x = x[:, : -b.chop_last_n_tokens]
-            masks = masks[:, : -b.chop_last_n_tokens]
-
-        if has_cls:
-            x = torch.cat([x_cls, x], dim=1)
-
-        # Fwd prop
-        for blk in b.predictor_blocks:
-            if b.use_activation_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(blk, x, masks, None, use_reentrant=False)
-            else:
-                x = blk(x, mask=masks, attn_mask=None)
-        x = b.predictor_norm(x)
-
-        if has_cls:
-            x = x[:, 1:, :]
-
-        # Return output corresponding to target tokens
-        if not b.return_all_tokens:
-            reverse_argsort = torch.argsort(argsort, dim=1)
-            x = torch.stack([x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0)
-            x = x[:, N_ctxt:]
-
-        x = b.predictor_proj(x)
-        return x
-
-
-class _PredictorMultiSeqWrapperWithCondition(nn.Module):
-    """
-    MultiSeq predictor wrapper that threads through an optional condition.
-    """
-
-    def __init__(self, backbone: _VisionTransformerPredictorWithCondition):
-        super().__init__()
-        self.backbone = backbone
-
-    def forward(self, x, masks_x, masks_y, has_cls: bool = False, cond_full: Optional[torch.Tensor] = None):
-        outs = [[] for _ in x]
-        for i, (xi, mxi, myi) in enumerate(zip(x, masks_x, masks_y)):
-            for xij, mxij, myij in zip(xi, mxi, myi):
-                outs[i] += [
-                    self.backbone(
-                        xij,
-                        mxij,
-                        myij,
-                        mask_index=i,
-                        has_cls=has_cls,
-                        cond_full=cond_full,
-                    )
-                ]
-        return outs
 
 

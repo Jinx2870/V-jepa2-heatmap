@@ -55,6 +55,7 @@ def init_data(
         auto_augment=auto_augment,
         motion_shift=motion_shift,
         crop_size=crop_size,
+        frames_per_clip=frames_per_clip,
     )
 
     make_webvid = None
@@ -115,6 +116,7 @@ def make_transforms(
     auto_augment=False,
     motion_shift=False,
     crop_size=224,
+    frames_per_clip=None,
     normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ):
 
@@ -127,6 +129,7 @@ def make_transforms(
         auto_augment=auto_augment,
         motion_shift=motion_shift,
         crop_size=crop_size,
+        frames_per_clip=frames_per_clip,
         normalize=normalize,
     )
 
@@ -145,17 +148,22 @@ class VideoTransform(object):
         auto_augment=False,
         motion_shift=False,
         crop_size=224,
+        frames_per_clip=None,
         normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ):
 
         self.training = training
+        self.expected_frames = frames_per_clip
+
+        self._mean = normalize[0]
+        self._std = normalize[1]
 
         # Evaluation transform: directly resize frames to (crop_size x crop_size)
         self.eval_transform = video_transforms.Compose(
             [
                 video_transforms.Resize((crop_size, crop_size), interpolation="bilinear"),
                 volume_transforms.ClipToTensor(),
-                video_transforms.Normalize(mean=normalize[0], std=normalize[1]),
+                video_transforms.Normalize(mean=self._mean, std=self._std),
             ]
         )
 
@@ -186,34 +194,62 @@ class VideoTransform(object):
             device="cpu",
         )
 
+    def _assert_output(self, clip: torch.Tensor):
+        """
+        Ensure clip is a 4D tensor in canonical video format: [C, T, H, W].
+        For this downstream (e1000.pt), we also want strict T=16 and H=W=256.
+        We enforce whatever was configured: crop_size and frames_per_clip.
+        """
+        if not torch.is_tensor(clip):
+            raise TypeError(f"VideoTransform must output a torch.Tensor, got {type(clip)}")
+        if clip.dim() != 4:
+            raise ValueError(f"Expected clip as [C,T,H,W] (4D), got shape={tuple(clip.shape)}")
+        C, T, H, W = clip.shape
+        if C != 3:
+            raise ValueError(f"Expected C=3, got C={C} (shape={tuple(clip.shape)})")
+        if int(H) != int(self.crop_size) or int(W) != int(self.crop_size):
+            raise ValueError(
+                f"Expected spatial size {self.crop_size}x{self.crop_size}, got {H}x{W} (shape={tuple(clip.shape)})"
+            )
+        if self.expected_frames is not None and int(T) != int(self.expected_frames):
+            raise ValueError(
+                f"Expected T={self.expected_frames} frames, got T={T} (shape={tuple(clip.shape)})"
+        )
+
     def __call__(self, buffer):
 
         if not self.training:
-            return self.eval_transform(buffer)
+            out = self.eval_transform(buffer)
+            self._assert_output(out)
+            return out
 
+        # IMPORTANT: keep the clip as a *list of frames* until AFTER spatial transforms,
+        # then convert to a single tensor [C,T,H,W]. This avoids treating the channel
+        # dimension as an iterable (which previously produced a list of 3 tensors).
         buffer = [transforms.ToPILImage()(frame) for frame in buffer]
 
         if self.auto_augment:
             buffer = self.autoaug_transform(buffer)
 
-        buffer = [transforms.ToTensor()(img) for img in buffer]
-        buffer = torch.stack(buffer)  # T C H W
-        buffer = buffer.permute(0, 2, 3, 1)  # T H W C
-
-        buffer = tensor_normalize(buffer, self.normalize[0], self.normalize[1])
-        buffer = buffer.permute(3, 0, 1, 2)  # T H W C -> C T H W
-
-        # Training transform: directly resize frames to (crop_size x crop_size)
+        # Training transform: resize frames to (crop_size x crop_size) while still a list
         resize = video_transforms.Resize((self.crop_size, self.crop_size), interpolation="bilinear")
         buffer = resize(buffer)
+
         if self.random_horizontal_flip:
-            buffer, _ = video_transforms.horizontal_flip(0.5, buffer)
+            # List-based flip (works for PIL/numpy lists). Keep this BEFORE ClipToTensor.
+            buffer = video_transforms.RandomHorizontalFlip()(buffer)
+
+        # Convert to tensor in canonical format [C,T,H,W], then normalize
+        buffer = volume_transforms.ClipToTensor()(buffer)  # [C,T,H,W], float in [0,1]
+        buffer = video_transforms.Normalize(mean=self._mean, std=self._std)(buffer)
 
         if self.reprob > 0:
+            # RandomErasing expects [T,C,H,W]
             buffer = buffer.permute(1, 0, 2, 3)
             buffer = self.erase_transform(buffer)
             buffer = buffer.permute(1, 0, 2, 3)
 
+        self._assert_output(buffer)
         return buffer
 
 

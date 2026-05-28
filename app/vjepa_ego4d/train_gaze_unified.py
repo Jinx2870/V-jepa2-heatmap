@@ -48,6 +48,7 @@ from app.vjepa_ego4d.ego4d import init_gaze_data
 from src.utils.logging import AverageMeter, WandbLogger
 from src.utils.distributed import init_distributed
 from src.utils.checkpoint_loader import robust_checkpoint_loader
+from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule, WSDSchedule
 
 
 _GLOBAL_SEED = 0
@@ -261,7 +262,6 @@ def main(args: Dict[str, Any]) -> None:
         pred_depth=pred_depth,
         pred_embed_dim=pred_embed_dim,
         pred_num_heads=pred_num_heads,
-        predictor_mode="causal",
         uniform_power=uniform_power,
         use_sdpa=use_sdpa,
         use_rope=use_rope,
@@ -272,9 +272,6 @@ def main(args: Dict[str, Any]) -> None:
         gazelle_cfg=gazelle_cfg,
         init_gazelle=bool(use_gazelle),
     ).to(device)
-
-    if model.predictor_causal is None:
-        raise RuntimeError("Model was constructed with predictor_mode='causal' but predictor_causal is None.")
 
     # Optional: load pretrained encoder weights
     meta = args.get("meta", {}) or {}
@@ -310,9 +307,19 @@ def main(args: Dict[str, Any]) -> None:
     cfgs_opt = args.get("optimization", {})
     lr = float(cfgs_opt.get("lr", 1e-4))
     wd = float(cfgs_opt.get("weight_decay", 0.05))
+    final_lr = float(cfgs_opt.get("final_lr", 0.0))
+    start_lr = float(cfgs_opt.get("start_lr", lr))
+    warmup = float(cfgs_opt.get("warmup", 0.0))
+    anneal = float(cfgs_opt.get("anneal", 0.0))
+    final_wd = float(cfgs_opt.get("final_weight_decay", wd))
+    ipe_scale = float(cfgs_opt.get("ipe_scale", 1.25))
+    betas = tuple(cfgs_opt.get("betas", (0.9, 0.999)))
+    eps = float(cfgs_opt.get("eps", 1e-8))
     num_epochs = int(cfgs_opt.get("epochs", 1))
     ipe = cfgs_opt.get("ipe", None)
     ipe = int(ipe) if ipe is not None else None
+    grad_clip = cfgs_opt.get("grad_clip", None)
+    grad_clip = float(grad_clip) if grad_clip is not None else None
 
     cfgs_loss = args.get("loss", {})
     loss_exp = float(cfgs_loss.get("loss_exp", 2.0))
@@ -321,11 +328,61 @@ def main(args: Dict[str, Any]) -> None:
     T_enc = max(1, frames_per_clip // max(1, tubelet_size))
     auto_steps = int(max(1, min(cfgs_loss.get("auto_steps", 1), max(T_enc - 1, 1))))
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr,
-        weight_decay=wd,
-    )
+    # --- Optimizer with bias/1D params excluded from weight decay (matches repo style)
+    _trainable = [(n, p) for (n, p) in model.named_parameters() if p.requires_grad]
+    _decay = [p for (n, p) in _trainable if ("bias" not in n) and (p.ndim != 1)]
+    _no_decay = [p for (n, p) in _trainable if ("bias" in n) or (p.ndim == 1)]
+    param_groups = [
+        {"params": _decay},
+        {"params": _no_decay, "WD_exclude": True, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=wd, betas=betas, eps=eps)
+
+    # --- LR/WD schedulers (step-level)
+    try:
+        _loader_len = len(loader)
+    except Exception:
+        _loader_len = None
+    if ipe is None:
+        if _loader_len is None:
+            raise RuntimeError("Could not infer iterations_per_epoch; set optimization.ipe in config.")
+        ipe_effective = int(_loader_len)
+    else:
+        ipe_effective = int(ipe)
+
+    # If anneal>0, use WSDSchedule (warmup -> constant -> linear anneal).
+    # Otherwise fall back to WarmupCosineSchedule (warmup -> cosine to final_lr).
+    if anneal and anneal > 0:
+        scheduler = WSDSchedule(
+            optimizer,
+            warmup_steps=int(warmup * ipe_effective),
+            anneal_steps=int(anneal * ipe_effective),
+            start_lr=start_lr,
+            ref_lr=lr,
+            final_lr=final_lr,
+            T_max=int(num_epochs * ipe_effective),
+        )
+        wd_scheduler = CosineWDSchedule(
+            optimizer,
+            ref_wd=wd,
+            final_wd=final_wd,
+            T_max=int(num_epochs * ipe_effective),
+        )
+    else:
+        scheduler = WarmupCosineSchedule(
+            optimizer,
+            warmup_steps=int(warmup * ipe_effective),
+            start_lr=start_lr,
+            ref_lr=lr,
+            final_lr=final_lr,
+            T_max=int(ipe_scale * num_epochs * ipe_effective),
+        )
+        wd_scheduler = CosineWDSchedule(
+            optimizer,
+            ref_wd=wd,
+            final_wd=final_wd,
+            T_max=int(ipe_scale * num_epochs * ipe_effective),
+        )
 
     # -------------------------
     # Checkpointing (match repo style: latest.pt + periodic e{epoch}.pt)
@@ -333,6 +390,7 @@ def main(args: Dict[str, Any]) -> None:
     save_every_freq = int(cfgs_meta.get("save_every_freq", -1))
     resume_ckpt = cfgs_meta.get("resume_checkpoint", None)
     latest_path = os.path.join(folder, "latest.pt") if folder else None
+    global_step = 0
 
     def _save_checkpoint(epoch_1based: int) -> None:
         if rank != 0 or not folder:
@@ -340,6 +398,8 @@ def main(args: Dict[str, Any]) -> None:
         save_dict = {
             "epoch": int(epoch_1based),
             "global_step": int(global_step),
+            "sched_step": int(getattr(scheduler, "_step", 0.0)),
+            "wd_sched_step": int(getattr(wd_scheduler, "_step", 0.0)),
             # only save trainable parts + (optional) frozen encoder for reproducibility
             "encoder": model.encoder.backbone.state_dict(),
             "predictor_causal": model.predictor_causal.state_dict(),
@@ -356,6 +416,7 @@ def main(args: Dict[str, Any]) -> None:
         """
         Returns start_epoch (0-based) to continue training.
         """
+        nonlocal global_step
         if resume_ckpt is None and latest_path and os.path.exists(latest_path):
             ckpt_path = latest_path
         elif resume_ckpt is not None:
@@ -369,6 +430,8 @@ def main(args: Dict[str, Any]) -> None:
         try:
             if "encoder" in ckpt:
                 model.encoder.backbone.load_state_dict(ckpt["encoder"], strict=False)
+                # training targets come from target_encoder; keep it consistent with resumed encoder
+                target_encoder.load_state_dict(ckpt["encoder"], strict=False)
             if "predictor_causal" in ckpt:
                 model.predictor_causal.load_state_dict(ckpt["predictor_causal"], strict=False)
             if use_gazelle and ckpt.get("scene_proj", None) is not None:
@@ -377,10 +440,24 @@ def main(args: Dict[str, Any]) -> None:
                 optimizer.load_state_dict(ckpt["opt"])
             if scaler is not None and ckpt.get("scaler", None) is not None:
                 scaler.load_state_dict(ckpt["scaler"])
-            start_epoch_1based = int(ckpt.get("epoch", 0))
+            start_epoch_1based = int(ckpt.get("epoch", 0))  # last completed epoch (1-based)
+            global_step = int(ckpt.get("global_step", 0))
+
+            # bring schedulers to the same step as the checkpoint
+            sched_step = int(ckpt.get("sched_step", global_step))
+            wd_sched_step = int(ckpt.get("wd_sched_step", global_step))
+            if hasattr(scheduler, "_step"):
+                scheduler._step = float(sched_step)
+            if hasattr(wd_scheduler, "_step"):
+                wd_scheduler._step = float(wd_sched_step)
+
             if rank == 0:
-                print(f"Resumed from checkpoint: {ckpt_path} (epoch={start_epoch_1based})")
-            return max(0, start_epoch_1based - 1)
+                print(
+                    f"Resumed from checkpoint: {ckpt_path} "
+                    f"(epoch={start_epoch_1based}, global_step={global_step}, sched_step={sched_step})"
+                )
+            # Continue with the *next* epoch (0-based)
+            return max(0, start_epoch_1based)
         except Exception as e:
             if rank == 0:
                 print(f"WARNING: failed to resume from {ckpt_path}: {e}")
@@ -500,14 +577,17 @@ def main(args: Dict[str, Any]) -> None:
     # -------------------------
     # Training loop (TF + AR)
     # -------------------------
-    global_step = 0
     start_epoch = _try_resume()
     eval_freq = int(cfgs_meta.get("eval_freq", 1))
     for epoch in range(start_epoch, num_epochs):
         sampler.set_epoch(epoch)
         it = iter(loader)
-        epoch_ipe = ipe if ipe is not None else len(loader)
+        epoch_ipe = ipe_effective
         for itr in range(epoch_ipe):
+            # make wandb steps strictly increasing (wandb treats each log commit as advancing)
+            global_step += 1
+            _new_lr = float(scheduler.step())
+            _new_wd = float(wd_scheduler.step())
             try:
                 frames = next(it).to(device, non_blocking=True)  # [B,C,T,H,W]
             except StopIteration:
@@ -533,10 +613,15 @@ def main(args: Dict[str, Any]) -> None:
             if mixed_precision:
                 assert scaler is not None
                 scaler.scale(loss).backward()
+                if grad_clip is not None and grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -545,23 +630,24 @@ def main(args: Dict[str, Any]) -> None:
                 _tf = float(jloss.detach())
                 _ar = float(sloss.detach())
                 print(
-                    f"[e{epoch} it{itr} step{global_step}] frames={tuple(frames.shape)} "
+                    f"[e{epoch + 1} it{itr} step{global_step}] frames={tuple(frames.shape)} "
                     f"loss={_loss:.6f} tf={_tf:.6f} ar={_ar:.6f} "
+                    f"lr={_new_lr:.2e} wd={_new_wd:.2e} "
                     f"(mixed_precision={mixed_precision}, dtype={which_dtype}, sdpa={use_sdpa})"
                 )
                 wandb_logger.log(
                     {
-                        "epoch": epoch,
+                        "epoch": epoch + 1,
                         "iter": itr,
                         "train/loss": _loss,
                         "train/tf_loss": _tf,
                         "train/ar_loss": _ar,
+                        "train/lr": _new_lr,
+                        "train/wd": _new_wd,
                         "train/batch_size": int(frames.shape[0]),
                     },
                     step=global_step,
                 )
-
-            global_step += 1
 
         _save_checkpoint(epoch_1based=epoch + 1)
         if eval_freq > 0 and ((epoch + 1) % eval_freq == 0):

@@ -1,0 +1,73 @@
+eval_name: action_anticipation_frozen
+
+# Wandb configuration (optional)
+use_wandb: true
+wandb_project: vjepa-action-anticipation
+wandb_name: ego4d-keystep-vitl-gazelle-conditioned
+
+experiment:
+  classifier:
+    num_heads: 8
+    num_probe_blocks: 2
+  data:
+    dataset: EGO4D_KEYSTEP
+    base_path: /data3/lg2/human_wm/Ego4d/exo_data/takes
+    dataset_train: /data3/lg2/human_wm/Ego4d/test/annotations/keystep_train.json
+    dataset_val: /data3/lg2/human_wm/Ego4d/test/annotations/keystep_val.json
+
+    # 用 pretrain 阶段同一份视频集合来筛选 take+camera（output2.txt 每行是一个绝对 mp4 路径）
+    video_list_file: /data3/lg2/human_wm/Ego4d/test/output2.txt
+
+    # 若 video_list_file 未命中某些 take，会 fallback 到 base_path + camera_glob 查找
+    camera_glob: "cam*.mp4"
+
+    frames_per_clip: 64
+    frames_per_second: 4
+    resolution: 256
+    random_resize_scale: [0.9, 1.0]
+    reprob: 0.0
+    train_anticipation_time_sec: [0.5, 2.0]
+    train_anticipation_point: [0.1, 0.1]
+    anticipation_time_sec: [0.5, 2.0]
+    val_anticipation_point: [0.0, 0.0]
+    num_workers: 12
+    pin_memory: true
+
+  optimization:
+    batch_size: 16
+    num_epochs: 1000
+    use_bfloat16: true
+    use_focal_loss: false
+    multihead_kwargs:
+      - {weight_decay: 0.04, final_weight_decay: 0.04, start_lr: 7.5e-5, lr: 4.25e-4, final_lr: 0.0, warmup: 15}
+
+model_kwargs:
+  # gaze-conditioned pretraining checkpoint（你提供的）
+  checkpoint: /data3/lg2/human_wm/V-jepa2-heatmap-new/logs/ego4d-heatmap-online-256px-gazelle224-grid16-n/e800.pt
+
+  # gaze-conditioned action anticipation wrapper
+  module_name: evals.action_anticipation_frozen.modelcustom.vit_encoder_predictor_concat_ar_gazelle
+
+  # 下面这两块沿用原生 action_anticipation_frozen 的 encoder/predictor 构建方式
+  # 预训练 train_gaze_unified 保存的 key 为 predictor_causal，此处须一致
+  pretrain_kwargs:
+    encoder: {model_name: vit_large, checkpoint_key: encoder}
+    predictor: {model_name: vit_predictor, checkpoint_key: predictor_causal, use_mask_tokens: true, num_mask_tokens: 10}
+
+    # Gazelle conditioning 需要一个投影层（训练于 gaze-pretrain），默认从 ckpt['scene_proj'] 加载
+    scene_proj_checkpoint_key: scene_proj
+
+    gazelle:
+      checkpoint: /data3/lg2/human_wm/gazelle/checkpoints/gazelle_dinov2_vitb14_inout.pt
+      model_name: gazelle_dinov2_vitb14_inout
+      python_path: /data3/lg2/human_wm/gazelle
+      device: cuda
+      input_size: 224
+      max_batch_size: 64
+
+  wrapper_kwargs: {num_output_frames: 2, num_steps: 1}
+
+tag: ego4d-keystep-vitl-gazelle-conditioned
+folder: /tmp/ego4d_keystep_gazelle_conditioned/
+
+

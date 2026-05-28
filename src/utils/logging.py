@@ -94,6 +94,14 @@ class WandbLogger(object):
                     **kwargs
                 )
                 get_logger(__name__).info(f"Wandb initialized: project={project}, name={name}")
+                # Metric axis conventions:
+                # - Train metrics keep using the global wandb step (we pass `step=` in train loop).
+                # - Validation metrics are plotted against `epoch` (we log `epoch` and do NOT pass `step=`).
+                try:
+                    wandb.define_metric("epoch")
+                    wandb.define_metric("val/*", step_metric="epoch")
+                except Exception:
+                    pass
             except Exception as e:
                 get_logger(__name__).warning(f"Failed to initialize wandb: {e}")
                 self.enabled = False
